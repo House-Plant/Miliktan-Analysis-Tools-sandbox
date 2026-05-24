@@ -902,6 +902,68 @@ def _format_seed_invalid_diagnostic(diagnostic: Optional[Dict[str, object]]) -> 
 
     return f"track={track_id} reason={reason}"
 
+def _group_debug_hypothesis_seeds(
+    hypothesis_seeds: Optional[object],
+    global_min: float,
+    global_max: float,
+    debug: bool = False,
+) -> Dict[int, List[np.ndarray]]:
+    """
+    Normalize optional manual interior-breakpoint seeds and bucket them by
+    target segment count.
+    """
+    if hypothesis_seeds is None:
+        return {}
+
+    if isinstance(hypothesis_seeds, np.ndarray):
+        raw_seeds = (hypothesis_seeds,)
+    elif isinstance(hypothesis_seeds, (list, tuple)):
+        if len(hypothesis_seeds) == 0:
+            raw_seeds = ()
+        elif np.isscalar(hypothesis_seeds[0]):
+            raw_seeds = (hypothesis_seeds,)
+        else:
+            raw_seeds = tuple(hypothesis_seeds)
+    else:
+        raw_seeds = (hypothesis_seeds,)
+
+    grouped: Dict[int, List[np.ndarray]] = {}
+    seen = set()
+    for seed_idx, seed in enumerate(raw_seeds, start=1):
+        try:
+            values = np.asarray(seed, dtype=float).reshape(-1)
+        except Exception as exc:
+            if debug:
+                print(
+                    f"[seed-debug] skipped hypothesis seed {seed_idx}: "
+                    f"could not coerce to floats ({exc!r})"
+                )
+            continue
+        if not np.all(np.isfinite(values)):
+            if debug:
+                print(
+                    f"[seed-debug] skipped hypothesis seed {seed_idx}: "
+                    "contains non-finite values"
+                )
+            continue
+
+        values = np.sort(values)
+        if np.any(values <= global_min) or np.any(values >= global_max):
+            if debug:
+                print(
+                    f"[seed-debug] skipped hypothesis seed {seed_idx}: "
+                    f"must lie strictly inside ({global_min:.6f}, {global_max:.6f})"
+                )
+            continue
+
+        key = tuple(np.round(values, 12))
+        if key in seen:
+            continue
+        seen.add(key)
+        grouped.setdefault(int(values.size) + 1, []).append(values)
+
+    return grouped
+
 def _shared_break_seed_sets(
     n_segments: int,
     candidate_grid: np.ndarray,
@@ -1016,6 +1078,8 @@ def optimize_seeds(
     bandwidth=None,
     debug: bool = False,
     diagnose=None,
+    manual_seeds: Optional[List[np.ndarray]] = None,
+    validate_manual_seeds: bool = True,
 ):
     """
     Optimize MeanShift-derived breakpoint seeds by coordinate descent.
@@ -1023,33 +1087,66 @@ def optimize_seeds(
     n_breaks = n_segments - 1
     best: Optional[Dict[str, object]] = None
 
-    seed_results: List[Tuple[np.ndarray, Dict[str, object]]] = []
-    initial_seeds = _shared_break_seed_sets(
+    seed_results: List[Tuple[np.ndarray, Optional[Dict[str, object]]]] = []
+    auto_seeds = _shared_break_seed_sets(
         n_segments,
         candidate_grid,
         bandwidth=bandwidth,
         debug=debug,
     )
+    manual_seed_list = [np.sort(np.asarray(seed, dtype=float)) for seed in (manual_seeds or [])]
+    manual_seed_keys = {tuple(np.round(seed, 12)) for seed in manual_seed_list}
+
+    initial_seeds: List[np.ndarray] = []
+    seen = set()
+    for seed in manual_seed_list + auto_seeds:
+        values = np.sort(np.asarray(seed, dtype=float))
+        key = tuple(np.round(values, 12))
+        if key in seen:
+            continue
+        seen.add(key)
+        initial_seeds.append(values)
+
+    if debug and manual_seed_list:
+        preview = [np.round(seed, 6).tolist() for seed in manual_seed_list[:8]]
+        print(
+            f"[seed-debug] k={n_segments}: injected {len(manual_seed_list)} "
+            f"hypothesis seed(s); preview={preview}"
+        )
 
     for seed_idx, seed in enumerate(initial_seeds, start=1):
         current = seed.copy()
+        seed_key = tuple(np.round(current, 12))
+        is_manual = seed_key in manual_seed_keys
+        seed_label = "hypothesis seed" if is_manual else "seed"
         current_result = evaluate(current)
         if current_result is None:
+            diagnostic_text = ""
+            if diagnose is not None:
+                diagnostic = diagnose(current)
+                if diagnostic is not None:
+                    diagnostic_text = " " + _format_seed_invalid_diagnostic(diagnostic)
+            if is_manual and not validate_manual_seeds:
+                if debug:
+                    print(
+                        f"[seed-debug] k={n_segments}: {seed_label} {seed_idx} "
+                        f"bypassed initial validity check "
+                        f"values={np.round(seed, 6).tolist()}{diagnostic_text}"
+                    )
+                seed_results.append((current, None))
+                continue
             if debug:
-                diagnostic_text = ""
-                if diagnose is not None:
-                    diagnostic = diagnose(current)
-                    if diagnostic is not None:
-                        diagnostic_text = " " + _format_seed_invalid_diagnostic(diagnostic)
                 print(
-                    f"[seed-debug] k={n_segments}: seed {seed_idx} invalid "
-                    f"{_format_seed_debug_summary(seed)}{diagnostic_text}"
+                    f"[seed-debug] k={n_segments}: {seed_label} {seed_idx} invalid "
+                    f"{_format_seed_debug_summary(seed)} "
+                    f"values={np.round(seed, 6).tolist()}{diagnostic_text}"
                 )
             continue
         if debug:
             print(
-                f"[seed-debug] k={n_segments}: seed {seed_idx} valid "
+                f"[seed-debug] k={n_segments}: {seed_label} {seed_idx} valid "
                 f"{_format_seed_debug_summary(seed)} "
+                f"values={np.round(seed, 6).tolist()} "
                 f"score={float(current_result['score']):.6f}"
             )
         seed_results.append((current, current_result))
@@ -1079,23 +1176,34 @@ def optimize_seeds(
                     trial = current.copy()
                     trial[0] = cand
                     trial_result = evaluate(trial)
-                    if trial_result is None: continue
-                    if trial_result["score"] < local_best["score"] - 1e-9:
+                    if trial_result is None:
+                        continue
+                    if local_best is None or trial_result["score"] < local_best["score"] - 1e-9:
                         local_best = trial_result
 
                 if local_best is not current_result:
                     if debug:
-                        old_score = float(current_result["score"])
                         old_summary = _format_seed_debug_summary(current)
+                        old_score = None if current_result is None else float(current_result["score"])
                     current_result = local_best
+                    if current_result is None:
+                        continue
                     current = np.asarray(current_result["interior_breaks"], dtype=float)
                     if debug:
-                        print(
-                            f"[seed-debug] k={n_segments}: single-break improvement "
-                            f"pass={passes} {old_summary} -> "
-                            f"{_format_seed_debug_summary(current)} "
-                            f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
-                        )
+                        if old_score is None:
+                            print(
+                                f"[seed-debug] k={n_segments}: single-break recovery "
+                                f"pass={passes} {old_summary} -> "
+                                f"{_format_seed_debug_summary(current)} "
+                                f"score={float(current_result['score']):.6f}"
+                            )
+                        else:
+                            print(
+                                f"[seed-debug] k={n_segments}: single-break improvement "
+                                f"pass={passes} {old_summary} -> "
+                                f"{_format_seed_debug_summary(current)} "
+                                f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
+                            )
                     improved = True
                 continue # Skip pairwise logic
             
@@ -1121,25 +1229,35 @@ def optimize_seeds(
                     trial_result = evaluate(trial)
                     if trial_result is None:
                         continue
-                    if trial_result["score"] < local_best["score"] - 1e-9:
+                    if local_best is None or trial_result["score"] < local_best["score"] - 1e-9:
                         local_best = trial_result
 
                 if local_best is not current_result:
                     if debug:
-                        old_score = float(current_result["score"])
                         old_summary = _format_seed_debug_summary(current)
+                        old_score = None if current_result is None else float(current_result["score"])
                     current_result = local_best
+                    if current_result is None:
+                        continue
                     current = np.asarray(current_result["interior_breaks"], dtype=float)
                     if debug:
-                        print(
-                            f"[seed-debug] k={n_segments}: pair improvement idx={idx} "
-                            f"pass={passes} {old_summary} -> "
-                            f"{_format_seed_debug_summary(current)} "
-                            f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
-                        )
+                        if old_score is None:
+                            print(
+                                f"[seed-debug] k={n_segments}: pair recovery idx={idx} "
+                                f"pass={passes} {old_summary} -> "
+                                f"{_format_seed_debug_summary(current)} "
+                                f"score={float(current_result['score']):.6f}"
+                            )
+                        else:
+                            print(
+                                f"[seed-debug] k={n_segments}: pair improvement idx={idx} "
+                                f"pass={passes} {old_summary} -> "
+                                f"{_format_seed_debug_summary(current)} "
+                                f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
+                            )
                     improved = True
 
-        if best is None or current_result["score"] < best["score"]:
+        if current_result is not None and (best is None or current_result["score"] < best["score"]):
             best = current_result
 
     if debug and best is not None:
@@ -1204,13 +1322,16 @@ def _optimize_shared_breaks_for_segment_count(
     max_passes: int = 12,
     bandwidth: Optional[float] = None,
     debug: bool = False,
+    manual_seeds: Optional[List[np.ndarray]] = None,
+    validate_manual_seeds: bool = True,
 ) -> Optional[Dict[str, object]]:
     """
     Coordinate-descent refinement of a shared breakpoint set for a fixed segment count.
     """
     n_breaks = n_segments - 1
     global_min, global_max = _global_time_bounds(tracks_data)
-    if n_breaks > candidate_grid.size:
+    manual_seed_list = list(manual_seeds or [])
+    if n_breaks > candidate_grid.size and not manual_seed_list:
         return None
 
     cache: Dict[Tuple[float, ...], Optional[Dict[str, object]]] = {}
@@ -1262,15 +1383,17 @@ def _optimize_shared_breaks_for_segment_count(
         return first_failure
 
     best = optimize_seeds(
-    n_segments=n_segments,
-    candidate_grid=candidate_grid,
-    evaluate=evaluate,
-    diagnose=diagnose,
-    max_passes=max_passes,  # Make sure max_passes is defined in this scope
-    global_min=global_min,  # Make sure global_min is defined in this scope
-    global_max=global_max, # Make sure global_max is defined in this scope
-    bandwidth=bandwidth,
-    debug=debug,
+        n_segments=n_segments,
+        candidate_grid=candidate_grid,
+        evaluate=evaluate,
+        diagnose=diagnose,
+        max_passes=max_passes,
+        global_min=global_min,
+        global_max=global_max,
+        bandwidth=bandwidth,
+        debug=debug,
+        manual_seeds=manual_seed_list,
+        validate_manual_seeds=validate_manual_seeds,
     )
     return best
 
@@ -1317,6 +1440,8 @@ def fit_shared_breakpoints_joint(
     show_progress: bool = False,
     breakpoint_cluster_bandwidth: Optional[float] = None,
     support_window_factor: Optional[float] = 2.0,
+    debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
+    debug_validate_hypothesis_seeds: bool = True,
 ) -> Dict[str, object]:
     """
     Jointly estimate one shared breakpoint set, then refit each track on its active subset.
@@ -1324,7 +1449,14 @@ def fit_shared_breakpoints_joint(
     Shared breakpoints are global in time, but each track only activates the subset
     that lies inside its observed time span.
     """
+    global_min, global_max = _global_time_bounds(tracks_data)
     candidate_grid = _candidate_break_grid(tracks_data, fitted_breaks)
+    manual_seed_map = _group_debug_hypothesis_seeds(
+        debug_hypothesis_seeds,
+        global_min=global_min,
+        global_max=global_max,
+        debug=show_progress,
+    )
     best_overall: Optional[Dict[str, object]] = None
     start_time = time.perf_counter()
 
@@ -1340,6 +1472,12 @@ def fit_shared_breakpoints_joint(
             print(
                 f"[seed-debug] candidate_grid preview head={preview_head} tail={preview_tail}"
             )
+        if manual_seed_map:
+            manual_summary = {
+                k: [np.round(seed, 6).tolist() for seed in seeds]
+                for k, seeds in sorted(manual_seed_map.items())
+            }
+            print(f"[seed-debug] manual hypothesis seeds by k={manual_summary}")
 
     for n_segments in range(1, max_segments + 1):
         iter_start = time.perf_counter()
@@ -1355,6 +1493,8 @@ def fit_shared_breakpoints_joint(
             support_window_factor=support_window_factor,
             bandwidth=breakpoint_cluster_bandwidth,
             debug=show_progress,
+            manual_seeds=manual_seed_map.get(n_segments),
+            validate_manual_seeds=debug_validate_hypothesis_seeds,
         )
         if best_for_k is None:
             if show_progress:
@@ -1891,6 +2031,8 @@ def _run_shared_breakpoint_group_fit(
     show_progress: bool,
     breakpoint_cluster_bandwidth: Optional[float] = None,
     support_window_factor: Optional[float] = 2.0,
+    debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
+    debug_validate_hypothesis_seeds: bool = True,
 ) -> Dict[str, Dict[str, object]]:
     """
     Run the shared-breakpoint optimization seeded by the first-pass fits and
@@ -1908,6 +2050,8 @@ def _run_shared_breakpoint_group_fit(
         show_progress=show_progress,
         breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
         support_window_factor=support_window_factor,
+        debug_hypothesis_seeds=debug_hypothesis_seeds,
+        debug_validate_hypothesis_seeds=debug_validate_hypothesis_seeds,
     )
     global_breaks = np.asarray(shared_fit["global_breaks"], dtype=float)
     global_support = np.asarray(shared_fit["global_break_support"], dtype=int)
@@ -1953,6 +2097,8 @@ def spline_fit_tracks_dict(
     exploratory_cache_path: Optional[Path] = None,
     breakpoint_cluster_bandwidth: Optional[float] = None,
     support_window_factor: Optional[float] = 2.0,
+    debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
+    debug_validate_hypothesis_seeds: bool = True,
 ) -> Dict[str, Dict[str, object]]:
     """
     Fit piecewise-linear models to every track in tracks_data.
@@ -1983,6 +2129,13 @@ def spline_fit_tracks_dict(
             only when each active track has nearby samples on both sides of
             the breakpoint. Set to ``None`` to restore the old
             ``min_segment_points``-based rule.
+        debug_hypothesis_seeds: Optional manual shared-breakpoint hypotheses
+            to inject when ``use_avg_breaks=True``. Each item is one interior-
+            breakpoint seed, and its length maps to ``k=len(seed)+1``.
+        debug_validate_hypothesis_seeds: If True, manual hypothesis seeds are
+            filtered by the usual initial validity check. If False, invalid
+            manual seeds are still allowed to enter refinement and are dropped
+            only if no valid neighboring configuration is found.
 
     Returns:
         Dict keyed by track_id with:
@@ -2028,6 +2181,8 @@ def spline_fit_tracks_dict(
         show_progress=show_progress,
         breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
         support_window_factor=support_window_factor,
+        debug_hypothesis_seeds=debug_hypothesis_seeds,
+        debug_validate_hypothesis_seeds=debug_validate_hypothesis_seeds,
     )
 
 
@@ -2108,7 +2263,9 @@ if __name__ == "__main__":
         min_segment_points=default_min_segment_points,
         show_progress=True,
         exploratory_cache_path=Path("phys330/lab2/src/cache/exploratory_cache.pkl"),
-        breakpoint_cluster_bandwidth=1
+        breakpoint_cluster_bandwidth=1,
+        debug_hypothesis_seeds=(np.array([4, 15, 22,25,45,48,62,83])),
+        debug_validate_hypothesis_seeds=False
     )
     plt.figure(figsize=(8, 5))
     for track_id, pair in pruned.items():
