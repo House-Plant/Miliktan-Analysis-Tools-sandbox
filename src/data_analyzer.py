@@ -2664,22 +2664,3 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.show()
 
-    """
-    # Save shared-breakpoint spline fits for a refined file to disk
-    try:
-        output_dir = Path("phys330/lab2/data_folder/fitted_unisplines")
-        out_path = save_avg_spline_for_file(
-            output_folder=output_dir,
-            file_stem=default_stem,
-            folder_path=REFINED_DATA_DIR,
-            max_segments=default_nodes,
-            criterion="bic",
-            min_points=default_min_nodes,
-            use_refined=True,
-            min_segment_points=default_min_segment_points,
-            show_progress=True,
-        )
-        print(f"Saved shared-breakpoint spline fit to {out_path}")
-    except ImportError:
-        print("pwlf not installed; skipping spline file export.")
-    """
