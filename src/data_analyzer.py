@@ -4,7 +4,7 @@ Simple plotting helpers for lab 2 point-tracking data.
 
 from pathlib import Path
 import sys
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 import hashlib
 import itertools
 import math
@@ -83,7 +83,273 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from data_extractor import DEFAULT_DATA_DIR, tracks_from_file, tracks_from_folder, REFINED_DATA_DIR
+from data_extractor import (
+    DEFAULT_DATA_DIR,
+    tracks_from_file,
+    tracks_from_folder,
+    REFINED_DATA_DIR,
+    split_by_track_id,
+    split_refined_by_track,
+)
+
+
+def _jsonify_value(value: object) -> object:
+    """
+    Convert numpy/path-heavy structures into JSON-serializable builtins.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonify_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify_value(item) for item in value]
+    return value
+
+
+def _append_fit_trace_event(
+    trace: Optional[List[Dict[str, object]]],
+    event: str,
+    **fields: object,
+) -> None:
+    """
+    Append one structured trace record if trace collection is enabled.
+    """
+    if trace is None:
+        return
+    record = {"event": str(event)}
+    for key, value in fields.items():
+        record[str(key)] = _jsonify_value(value)
+    trace.append(record)
+
+
+def _resolve_tracks_input(
+    tracks_input: Union[Dict[str, np.ndarray], str, Path],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
+    """
+    Accept either an in-memory track dict or a CSV path and return the normalized
+    track payload plus source metadata.
+    """
+    if isinstance(tracks_input, dict):
+        return tracks_input, {"kind": "in_memory"}
+
+    source_path = Path(tracks_input).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"{source_path} is not a readable file")
+
+    df = pd.read_csv(source_path)
+    columns = set(df.columns)
+    if {"track_id", "time_sec", "y_px"}.issubset(columns):
+        if {"x_px", "y_px"}.issubset(columns):
+            grouped = split_by_track_id(df)
+            tracks_data: Dict[str, np.ndarray] = {}
+            for track_id, payload in grouped.items():
+                time_sec = np.asarray(payload["time_sec"], dtype=float)
+                y_px = np.asarray(payload["xydata_px"][1], dtype=float)
+                tracks_data[track_id] = np.vstack((time_sec, y_px))
+            source_kind = "raw_csv"
+        else:
+            tracks_data = split_refined_by_track(df)
+            source_kind = "refined_csv"
+        return tracks_data, {
+            "kind": source_kind,
+            "path": str(source_path),
+            "columns": sorted(columns),
+        }
+
+    raise ValueError(
+        f"Could not infer track format from {source_path}. "
+        f"Columns were: {sorted(columns)}"
+    )
+
+
+def _node_x_se_values(fit: Dict[str, object], n_nodes: int) -> List[Optional[float]]:
+    """
+    Expand any available breakpoint-x uncertainty onto the full node list.
+    Endpoints currently have no x uncertainty estimate.
+    """
+    raw = fit.get("breakpoint_se")
+    if raw is None:
+        return [None] * n_nodes
+
+    values = np.asarray(raw, dtype=float).reshape(-1)
+    if values.size == n_nodes:
+        return [float(item) if np.isfinite(item) else None for item in values]
+    if values.size == max(0, n_nodes - 2):
+        return [None] + [float(item) if np.isfinite(item) else None for item in values] + [None]
+    return [None] * n_nodes
+
+
+def _track_quality_payload(
+    time_y: np.ndarray,
+    fit: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    Recompute one track's fixed-break fit details so exports include consistent
+    node values and quality metrics in both shared and independent modes.
+    """
+    t = np.asarray(time_y[0], dtype=float)
+    y = np.asarray(time_y[1], dtype=float)
+    breaks = np.asarray(fit["breakpoints"], dtype=float)
+    try:
+        details = fit_linear_spline_with_breaks_details(time_y, breaks)
+        slopes = np.asarray(details["slopes"], dtype=float)
+        slope_se = None if details["slope_se"] is None else np.asarray(details["slope_se"], dtype=float)
+        break_y = np.asarray(details["break_y"], dtype=float)
+        break_y_se = (
+            None if details["break_y_se"] is None else np.asarray(details["break_y_se"], dtype=float)
+        )
+        rss = float(details["rss"])
+    except Exception:
+        slopes = np.asarray(fit.get("slopes", []), dtype=float)
+        slope_se = None
+        if fit.get("slope_se") is not None:
+            slope_se = np.asarray(fit["slope_se"], dtype=float)
+        break_y = np.asarray(fit.get("break_y", np.interp(breaks, t, y)), dtype=float)
+        break_y_se = None
+        if fit.get("break_y_se") is not None:
+            break_y_se = np.asarray(fit["break_y_se"], dtype=float)
+        rss = 0.0
+
+    n_obs = int(y.size)
+    rmse = float(np.sqrt(rss / n_obs)) if n_obs > 0 else None
+    tss = float(np.sum((y - float(np.mean(y))) ** 2)) if n_obs > 0 else 0.0
+    if tss > 0:
+        r_squared = float(1.0 - rss / tss)
+    else:
+        r_squared = 1.0 if rss <= 1e-12 else None
+
+    return {
+        "breaks": breaks,
+        "break_y": break_y,
+        "break_y_se": break_y_se,
+        "slopes": slopes,
+        "slope_se": slope_se,
+        "rss": rss,
+        "n_obs": n_obs,
+        "rmse": rmse,
+        "r_squared": r_squared,
+        "n_segments": int(len(breaks) - 1),
+        "n_params": int(_track_parameter_count(breaks)),
+        "segment_counts": _segment_observation_counts(t, breaks),
+    }
+
+
+def _save_spline_fit_artifacts(
+    save_path: Union[str, Path],
+    tracks_data: Dict[str, np.ndarray],
+    fits: Dict[str, Dict[str, object]],
+    call_metadata: Dict[str, object],
+    source_metadata: Dict[str, object],
+    trace: Optional[List[Dict[str, object]]] = None,
+) -> Path:
+    """
+    Save fitted nodes, fit-quality payloads, and metadata into one directory.
+    """
+    output_dir = Path(save_path).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    nodes_rows: List[Dict[str, object]] = []
+    track_quality: Dict[str, Dict[str, object]] = {}
+    total_rss = 0.0
+    total_obs = 0
+
+    for track_id in sorted(fits):
+        fit = fits[track_id]
+        quality = _track_quality_payload(tracks_data[track_id], fit)
+        breaks = np.asarray(quality["breaks"], dtype=float)
+        break_y = np.asarray(quality["break_y"], dtype=float)
+        break_y_se = quality["break_y_se"]
+        x_se_values = _node_x_se_values(fit, breaks.size)
+
+        for node_index, (x_value, y_value) in enumerate(zip(breaks, break_y)):
+            y_se_value = None
+            if break_y_se is not None:
+                y_se_raw = float(np.asarray(break_y_se, dtype=float)[node_index])
+                y_se_value = y_se_raw if np.isfinite(y_se_raw) else None
+            nodes_rows.append(
+                {
+                    "track_id": track_id,
+                    "node_index": int(node_index),
+                    "x": float(x_value),
+                    "x_se": x_se_values[node_index],
+                    "y": float(y_value),
+                    "y_se": y_se_value,
+                    "is_endpoint": bool(node_index == 0 or node_index == breaks.size - 1),
+                }
+            )
+
+        track_quality[track_id] = {
+            "n_obs": int(quality["n_obs"]),
+            "n_segments": int(quality["n_segments"]),
+            "n_params": int(quality["n_params"]),
+            "rss": float(quality["rss"]),
+            "rmse": quality["rmse"],
+            "r_squared": quality["r_squared"],
+            "segment_counts": np.asarray(quality["segment_counts"], dtype=int).tolist(),
+            "slopes": np.asarray(quality["slopes"], dtype=float).tolist(),
+            "slope_se": None
+            if quality["slope_se"] is None
+            else np.asarray(quality["slope_se"], dtype=float).tolist(),
+            "breakpoints": breaks.tolist(),
+            "breakpoint_x_se": x_se_values,
+            "break_y": break_y.tolist(),
+            "break_y_se": None
+            if break_y_se is None
+            else np.asarray(break_y_se, dtype=float).tolist(),
+        }
+        total_rss += float(quality["rss"])
+        total_obs += int(quality["n_obs"])
+
+    shared_quality = None
+    if fits:
+        first_fit = next(iter(fits.values()))
+        if "global_breakpoints" in first_fit:
+            shared_quality = {
+                "global_breakpoints": _jsonify_value(first_fit.get("global_breakpoints")),
+                "global_breakpoint_support": _jsonify_value(first_fit.get("global_breakpoint_support")),
+                "joint_score": _jsonify_value(first_fit.get("joint_score")),
+                "joint_rss": _jsonify_value(first_fit.get("joint_rss")),
+                "joint_n_params": _jsonify_value(first_fit.get("joint_n_params")),
+                "joint_criterion": _jsonify_value(first_fit.get("joint_criterion")),
+            }
+
+    fit_quality_payload = {
+        "summary": {
+            "n_tracks": int(len(fits)),
+            "total_rss": float(total_rss),
+            "total_n_obs": int(total_obs),
+            "global_rmse": float(np.sqrt(total_rss / total_obs)) if total_obs > 0 else None,
+        },
+        "shared_fit": shared_quality,
+        "tracks": track_quality,
+    }
+
+    metadata_payload = {
+        "source": _jsonify_value(source_metadata),
+        "call": _jsonify_value(call_metadata),
+        "artifacts": {
+            "nodes_csv": "nodes.csv",
+            "fit_quality_json": "fit_quality.json",
+            "metadata_json": "metadata.json",
+        },
+        "trace": _jsonify_value(trace or []),
+    }
+
+    pd.DataFrame(nodes_rows).to_csv(output_dir / "nodes.csv", index=False)
+    with (output_dir / "fit_quality.json").open("w", encoding="utf-8") as fh:
+        json.dump(fit_quality_payload, fh, indent=2)
+    with (output_dir / "metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(metadata_payload, fh, indent=2)
+
+    return output_dir
 
 
 def plot_tracks_from_file(
@@ -1080,6 +1346,7 @@ def optimize_seeds(
     diagnose=None,
     manual_seeds: Optional[List[np.ndarray]] = None,
     validate_manual_seeds: bool = True,
+    trace: Optional[List[Dict[str, object]]] = None,
 ):
     """
     Optimize MeanShift-derived breakpoint seeds by coordinate descent.
@@ -1113,6 +1380,13 @@ def optimize_seeds(
             f"[seed-debug] k={n_segments}: injected {len(manual_seed_list)} "
             f"hypothesis seed(s); preview={preview}"
         )
+    if manual_seed_list:
+        _append_fit_trace_event(
+            trace,
+            "manual_seeds_injected",
+            k=n_segments,
+            seeds=[np.round(seed, 6).tolist() for seed in manual_seed_list],
+        )
 
     for seed_idx, seed in enumerate(initial_seeds, start=1):
         current = seed.copy()
@@ -1133,6 +1407,15 @@ def optimize_seeds(
                         f"bypassed initial validity check "
                         f"values={np.round(seed, 6).tolist()}{diagnostic_text}"
                     )
+                _append_fit_trace_event(
+                    trace,
+                    "seed_bypassed_initial_validity",
+                    k=n_segments,
+                    seed_index=seed_idx,
+                    manual=is_manual,
+                    seed=np.round(seed, 6).tolist(),
+                    diagnostic=diagnostic_text.strip() or None,
+                )
                 seed_results.append((current, None))
                 continue
             if debug:
@@ -1141,6 +1424,15 @@ def optimize_seeds(
                     f"{_format_seed_debug_summary(seed)} "
                     f"values={np.round(seed, 6).tolist()}{diagnostic_text}"
                 )
+            _append_fit_trace_event(
+                trace,
+                "seed_invalid",
+                k=n_segments,
+                seed_index=seed_idx,
+                manual=is_manual,
+                seed=np.round(seed, 6).tolist(),
+                diagnostic=diagnostic_text.strip() or None,
+            )
             continue
         if debug:
             print(
@@ -1149,10 +1441,21 @@ def optimize_seeds(
                 f"values={np.round(seed, 6).tolist()} "
                 f"score={float(current_result['score']):.6f}"
             )
+        _append_fit_trace_event(
+            trace,
+            "seed_valid",
+            k=n_segments,
+            seed_index=seed_idx,
+            manual=is_manual,
+            seed=np.round(seed, 6).tolist(),
+            score=float(current_result["score"]),
+        )
         seed_results.append((current, current_result))
 
     if debug and not seed_results:
         print(f"[seed-debug] k={n_segments}: no valid seed sets survived initial evaluation")
+    if not seed_results:
+        _append_fit_trace_event(trace, "no_valid_initial_seeds", k=n_segments)
 
     for current, current_result in seed_results:
 
@@ -1182,9 +1485,9 @@ def optimize_seeds(
                         local_best = trial_result
 
                 if local_best is not current_result:
+                    old_score = None if current_result is None else float(current_result["score"])
                     if debug:
                         old_summary = _format_seed_debug_summary(current)
-                        old_score = None if current_result is None else float(current_result["score"])
                     current_result = local_best
                     if current_result is None:
                         continue
@@ -1204,6 +1507,15 @@ def optimize_seeds(
                                 f"{_format_seed_debug_summary(current)} "
                                 f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
                             )
+                    _append_fit_trace_event(
+                        trace,
+                        "single_break_update",
+                        k=n_segments,
+                        pass_index=passes,
+                        previous_score=old_score,
+                        new_score=float(current_result["score"]),
+                        new_seed=np.round(current, 6).tolist(),
+                    )
                     improved = True
                 continue # Skip pairwise logic
             
@@ -1233,9 +1545,9 @@ def optimize_seeds(
                         local_best = trial_result
 
                 if local_best is not current_result:
+                    old_score = None if current_result is None else float(current_result["score"])
                     if debug:
                         old_summary = _format_seed_debug_summary(current)
-                        old_score = None if current_result is None else float(current_result["score"])
                     current_result = local_best
                     if current_result is None:
                         continue
@@ -1255,6 +1567,16 @@ def optimize_seeds(
                                 f"{_format_seed_debug_summary(current)} "
                                 f"score {old_score:.6f} -> {float(current_result['score']):.6f}"
                             )
+                    _append_fit_trace_event(
+                        trace,
+                        "pair_update",
+                        k=n_segments,
+                        pair_index=idx,
+                        pass_index=passes,
+                        previous_score=old_score,
+                        new_score=float(current_result["score"]),
+                        new_seed=np.round(current, 6).tolist(),
+                    )
                     improved = True
 
         if current_result is not None and (best is None or current_result["score"] < best["score"]):
@@ -1265,6 +1587,14 @@ def optimize_seeds(
             f"[seed-debug] k={n_segments}: best optimized seed="
             f"{_format_seed_debug_summary(np.asarray(best['interior_breaks'], dtype=float))} "
             f"score={float(best['score']):.6f}"
+        )
+    if best is not None:
+        _append_fit_trace_event(
+            trace,
+            "best_seed_selected",
+            k=n_segments,
+            seed=np.round(np.asarray(best["interior_breaks"], dtype=float), 6).tolist(),
+            score=float(best["score"]),
         )
 
     return best
@@ -1324,6 +1654,7 @@ def _optimize_shared_breaks_for_segment_count(
     debug: bool = False,
     manual_seeds: Optional[List[np.ndarray]] = None,
     validate_manual_seeds: bool = True,
+    trace: Optional[List[Dict[str, object]]] = None,
 ) -> Optional[Dict[str, object]]:
     """
     Coordinate-descent refinement of a shared breakpoint set for a fixed segment count.
@@ -1394,6 +1725,7 @@ def _optimize_shared_breaks_for_segment_count(
         debug=debug,
         manual_seeds=manual_seed_list,
         validate_manual_seeds=validate_manual_seeds,
+        trace=trace,
     )
     return best
 
@@ -1442,6 +1774,7 @@ def fit_shared_breakpoints_joint(
     support_window_factor: Optional[float] = 2.0,
     debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
     debug_validate_hypothesis_seeds: bool = True,
+    trace: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """
     Jointly estimate one shared breakpoint set, then refit each track on its active subset.
@@ -1459,6 +1792,14 @@ def fit_shared_breakpoints_joint(
     )
     best_overall: Optional[Dict[str, object]] = None
     start_time = time.perf_counter()
+    _append_fit_trace_event(
+        trace,
+        "shared_fit_start",
+        n_tracks=len(tracks_data),
+        max_segments=max_segments,
+        candidate_grid=candidate_grid,
+        criterion=criterion,
+    )
 
     if show_progress:
         print(
@@ -1478,9 +1819,19 @@ def fit_shared_breakpoints_joint(
                 for k, seeds in sorted(manual_seed_map.items())
             }
             print(f"[seed-debug] manual hypothesis seeds by k={manual_summary}")
+    if manual_seed_map:
+        _append_fit_trace_event(
+            trace,
+            "manual_seed_map",
+            seeds_by_k={
+                k: [np.round(seed, 6).tolist() for seed in seeds]
+                for k, seeds in sorted(manual_seed_map.items())
+            },
+        )
 
     for n_segments in range(1, max_segments + 1):
         iter_start = time.perf_counter()
+        _append_fit_trace_event(trace, "segment_count_start", k=n_segments)
         if show_progress:
             print(f"[shared-fit] evaluating {n_segments} shared segment(s)")
         best_for_k = _optimize_shared_breaks_for_segment_count(
@@ -1495,8 +1846,10 @@ def fit_shared_breakpoints_joint(
             debug=show_progress,
             manual_seeds=manual_seed_map.get(n_segments),
             validate_manual_seeds=debug_validate_hypothesis_seeds,
+            trace=trace,
         )
         if best_for_k is None:
+            _append_fit_trace_event(trace, "segment_count_invalid", k=n_segments)
             if show_progress:
                 elapsed = time.perf_counter() - iter_start
                 print(
@@ -1504,10 +1857,19 @@ def fit_shared_breakpoints_joint(
                     f"({elapsed:.2f}s)"
                 )
             continue
+        elapsed = time.perf_counter() - iter_start
+        interior = np.asarray(best_for_k["interior_breaks"], dtype=float)
+        rounded = np.round(interior, 3).tolist()
+        trace_breaks = np.round(interior, 6).tolist()
+        _append_fit_trace_event(
+            trace,
+            "segment_count_best",
+            k=n_segments,
+            score=float(best_for_k["score"]),
+            interior_breaks=trace_breaks,
+            elapsed_seconds=float(elapsed),
+        )
         if show_progress:
-            elapsed = time.perf_counter() - iter_start
-            interior = np.asarray(best_for_k["interior_breaks"], dtype=float)
-            rounded = np.round(interior, 3).tolist()
             print(
                 f"[shared-fit] best for {n_segments} segment(s): "
                 f"{criterion.upper()}={best_for_k['score']:.3f}, "
@@ -1593,6 +1955,14 @@ def fit_shared_breakpoints_joint(
             f"{criterion.upper()}={best_overall['score']:.3f}, "
             f"global breaks={chosen} ({elapsed:.2f}s total)"
         )
+    _append_fit_trace_event(
+        trace,
+        "shared_fit_selected_model",
+        k=int(len(np.asarray(best_overall["global_breaks"], dtype=float)) - 1),
+        global_breaks=np.round(np.asarray(best_overall["global_breaks"], dtype=float), 6).tolist(),
+        score=float(best_overall["score"]),
+        elapsed_seconds=float(time.perf_counter() - start_time),
+    )
     return best_overall
 
 
@@ -2033,6 +2403,7 @@ def _run_shared_breakpoint_group_fit(
     support_window_factor: Optional[float] = 2.0,
     debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
     debug_validate_hypothesis_seeds: bool = True,
+    trace: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
     Run the shared-breakpoint optimization seeded by the first-pass fits and
@@ -2052,6 +2423,7 @@ def _run_shared_breakpoint_group_fit(
         support_window_factor=support_window_factor,
         debug_hypothesis_seeds=debug_hypothesis_seeds,
         debug_validate_hypothesis_seeds=debug_validate_hypothesis_seeds,
+        trace=trace,
     )
     global_breaks = np.asarray(shared_fit["global_breaks"], dtype=float)
     global_support = np.asarray(shared_fit["global_break_support"], dtype=int)
@@ -2079,6 +2451,7 @@ def _run_shared_breakpoint_group_fit(
             "global_breakpoint_support": list(global_support),
             "joint_score": float(shared_fit["score"]),
             "joint_rss": float(shared_fit["rss"]),
+            "joint_n_params": int(shared_fit["n_params"]),
             "joint_criterion": criterion,
         }
 
@@ -2086,7 +2459,7 @@ def _run_shared_breakpoint_group_fit(
 
 
 def spline_fit_tracks_dict(
-    tracks_data: Dict[str, np.ndarray],
+    tracks_input: Union[Dict[str, np.ndarray], str, Path],
     max_segments: int = 6,
     criterion: str = "bic",
     min_points: int = 4,
@@ -2099,12 +2472,14 @@ def spline_fit_tracks_dict(
     support_window_factor: Optional[float] = 2.0,
     debug_hypothesis_seeds: Optional[Tuple[np.ndarray, ...]] = None,
     debug_validate_hypothesis_seeds: bool = True,
+    save_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Dict[str, object]]:
     """
-    Fit piecewise-linear models to every track in tracks_data.
+    Fit piecewise-linear models to every track in one dataset.
 
     Args:
-        tracks_data: Dict track_id -> (2, N) array [time, y].
+        tracks_input: Either a dict of ``track_id -> (2, N)`` arrays
+            ``[time, y]`` or a path to one extracted CSV file.
         max_segments: Max segments for pwlf search.
         criterion: 'bic' or 'aic'.
         min_points: Minimum points required to fit.
@@ -2136,6 +2511,8 @@ def spline_fit_tracks_dict(
             filtered by the usual initial validity check. If False, invalid
             manual seeds are still allowed to enter refinement and are dropped
             only if no valid neighboring configuration is found.
+        save_path: Optional directory where fitted nodes, fit-quality summaries,
+            and metadata should be written. The directory is created if needed.
 
     Returns:
         Dict keyed by track_id with:
@@ -2145,11 +2522,13 @@ def spline_fit_tracks_dict(
         If use_avg_breaks=True, results reflect refits using jointly-estimated
         shared breakpoints across all tracks.
     """
+    tracks_data, source_metadata = _resolve_tracks_input(tracks_input)
     if not tracks_data:
         raise ValueError("tracks_data is empty")
     criterion = criterion.lower()
     if criterion not in {"bic", "aic"}:
         raise ValueError("criterion must be 'bic' or 'aic'")
+    fit_trace: Optional[List[Dict[str, object]]] = [] if (save_path is not None and use_avg_breaks) else None
     exploratory_results, fitted_breaks = _get_or_run_exploratory_track_fits(
         tracks_data,
         max_segments=max_segments,
@@ -2169,21 +2548,52 @@ def spline_fit_tracks_dict(
             # in-memory as `mapping`.
         except Exception:
             pass
-        return exploratory_results
+        results = exploratory_results
+    else:
+        results = _run_shared_breakpoint_group_fit(
+            tracks_data,
+            fitted_breaks=fitted_breaks,
+            max_segments=max_segments,
+            criterion=criterion,
+            min_points=min_points,
+            min_segment_points=min_segment_points,
+            show_progress=show_progress,
+            breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
+            support_window_factor=support_window_factor,
+            debug_hypothesis_seeds=debug_hypothesis_seeds,
+            debug_validate_hypothesis_seeds=debug_validate_hypothesis_seeds,
+            trace=fit_trace,
+        )
 
-    return _run_shared_breakpoint_group_fit(
-        tracks_data,
-        fitted_breaks=fitted_breaks,
-        max_segments=max_segments,
-        criterion=criterion,
-        min_points=min_points,
-        min_segment_points=min_segment_points,
-        show_progress=show_progress,
-        breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
-        support_window_factor=support_window_factor,
-        debug_hypothesis_seeds=debug_hypothesis_seeds,
-        debug_validate_hypothesis_seeds=debug_validate_hypothesis_seeds,
-    )
+    if save_path is not None:
+        call_metadata = {
+            "max_segments": int(max_segments),
+            "criterion": criterion,
+            "min_points": int(min_points),
+            "use_avg_breaks": bool(use_avg_breaks),
+            "cluster_on_mismatch": bool(cluster_on_mismatch),
+            "min_segment_points": int(min_segment_points),
+            "show_progress": bool(show_progress),
+            "exploratory_cache_path": None
+            if exploratory_cache_path is None
+            else str(Path(exploratory_cache_path).expanduser().resolve()),
+            "breakpoint_cluster_bandwidth": breakpoint_cluster_bandwidth,
+            "support_window_factor": support_window_factor,
+            "debug_hypothesis_seeds": None
+            if debug_hypothesis_seeds is None
+            else [np.asarray(seed, dtype=float).tolist() for seed in debug_hypothesis_seeds],
+            "debug_validate_hypothesis_seeds": bool(debug_validate_hypothesis_seeds),
+        }
+        _save_spline_fit_artifacts(
+            save_path=save_path,
+            tracks_data=tracks_data,
+            fits=results,
+            call_metadata=call_metadata,
+            source_metadata=source_metadata,
+            trace=fit_trace,
+        )
+
+    return results
 
 
 def save_avg_spline_for_file(
@@ -2201,18 +2611,20 @@ def save_avg_spline_for_file(
     support_window_factor: Optional[float] = 2.0,
 ) -> Path:
     """
-    Fit shared-breakpoint splines for a single file and save one CSV.
+    Fit shared-breakpoint splines for a single file and save one artifact
+    directory containing nodes, fit-quality metrics, and metadata.
 
     If ``exploratory_cache_path`` is provided, the expensive first-pass fits
     are cached there and reused on later calls when the source data and
     exploratory settings still match.
 
-    Returns the path to the written file. Columns:
-      spline_x_1, spline_y_1, slopes_1, breakpoints_1, spline_x_2, ...
+    Returns the path to the written artifact directory.
     """
-    tracks = tracks_from_file(file_stem=file_stem, data_folder=folder_path, use_refined=use_refined)
-    fits = spline_fit_tracks_dict(
-        tracks,
+    source_folder = REFINED_DATA_DIR if use_refined else Path(folder_path).expanduser().resolve()
+    source_path = Path(source_folder).expanduser().resolve() / f"{file_stem}.csv"
+    save_dir = Path(output_folder).expanduser().resolve() / file_stem
+    spline_fit_tracks_dict(
+        source_path,
         max_segments=max_segments,
         criterion=criterion,
         min_points=min_points,
@@ -2222,30 +2634,18 @@ def save_avg_spline_for_file(
         min_segment_points=min_segment_points,
         show_progress=show_progress,
         support_window_factor=support_window_factor,
+        save_path=save_dir,
     )
-
-    output_folder = Path(output_folder).expanduser().resolve()
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    row = {}
-    for j, track_id in enumerate(sorted(fits.keys()), start=1):
-        fit = fits[track_id]
-        row[f"spline_x_{j}"] = json.dumps(list(fit["spline_xy"][0]))
-        row[f"spline_y_{j}"] = json.dumps(list(fit["spline_xy"][1]))
-        row[f"slopes_{j}"] = json.dumps(fit["slopes"])
-        row[f"slope_se_{j}"] = json.dumps(fit["slope_se"])
-        row[f"break_x_{j}"] = json.dumps(fit["breakpoints"])
-        row[f"break_y_{j}"] = json.dumps(fit.get("break_y"))
-        row[f"break_x_se_{j}"] = json.dumps(fit.get("breakpoint_se"))
-        row[f"break_y_se_{j}"] = json.dumps(fit.get("break_y_se"))
-    out_path = output_folder / f"{file_stem}.csv"
-    pd.DataFrame([row]).to_csv(out_path, index=False)
-    return out_path
+    return save_dir
 
 
 if __name__ == "__main__":
     
     default_stem= "trial3"
+    breakpoint_hypothesis_seeds = np.array([4, 15, 22,25,45,48,62,83])
+    spline_fit_save_dir = "phys330/lab2/data_folder/fitted_unisplines"
+    spline_fit_save_path = Path(spline_fit_save_dir) / default_stem
+    print (spline_fit_save_path)
     default_nodes = 10
     default_min_nodes = 3
     default_min_segment_points = 2
@@ -2264,7 +2664,7 @@ if __name__ == "__main__":
         show_progress=True,
         exploratory_cache_path=Path("phys330/lab2/src/cache/exploratory_cache.pkl"),
         breakpoint_cluster_bandwidth=1,
-        debug_hypothesis_seeds=(np.array([4, 15, 22,25,45,48,62,83])),
+        debug_hypothesis_seeds=breakpoint_hypothesis_seeds,
         debug_validate_hypothesis_seeds=False
     )
     plt.figure(figsize=(8, 5))
