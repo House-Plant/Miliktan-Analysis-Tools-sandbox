@@ -774,11 +774,11 @@ def _segment_observation_counts(t: np.ndarray, breaks: np.ndarray) -> np.ndarray
 
 
 def _support_window_from_times(
-    t: np.ndarray,
+    times: np.ndarray,
     support_window_factor: Optional[float],
 ) -> Optional[float]:
     """
-    Convert a track's typical sampling interval into a local breakpoint-support window.
+    Convert a typical sampling interval into a breakpoint-support window.
     """
     if support_window_factor is None:
         return None
@@ -786,7 +786,7 @@ def _support_window_from_times(
     if not np.isfinite(factor) or factor <= 0:
         return None
 
-    t_sorted = np.unique(np.sort(np.asarray(t, dtype=float)))
+    t_sorted = np.unique(np.sort(np.asarray(times, dtype=float)))
     if t_sorted.size < 2:
         return factor * 1e-12
 
@@ -801,45 +801,80 @@ def _support_window_from_times(
 
 
 def _breakpoint_support_record(
-    t: np.ndarray,
+    times: np.ndarray,
     tau: float,
     support_window_factor: Optional[float],
 ) -> Optional[Dict[str, float]]:
     """
-    Return left/right gap diagnostics for one breakpoint, or None if support checks are disabled.
+    Return left/right gap diagnostics for one breakpoint, or None if support
+    checks are disabled.
     """
-    window = _support_window_from_times(t, support_window_factor)
+    window = _support_window_from_times(times, support_window_factor)
     if window is None:
         return None
 
-    t_sorted = np.unique(np.sort(np.asarray(t, dtype=float)))
+    t_sorted = np.unique(np.sort(np.asarray(times, dtype=float)))
     left_idx = int(np.searchsorted(t_sorted, tau, side="left")) - 1
     right_idx = int(np.searchsorted(t_sorted, tau, side="right"))
 
     left_gap = math.inf if left_idx < 0 else float(tau - t_sorted[left_idx])
     right_gap = math.inf if right_idx >= t_sorted.size else float(t_sorted[right_idx] - tau)
-    supported = np.isfinite(left_gap) and np.isfinite(right_gap) and left_gap <= window and right_gap <= window
+    gap_width = float(left_gap + right_gap)
+    supported = (
+        np.isfinite(left_gap)
+        and np.isfinite(right_gap)
+        and gap_width <= 2.0 * float(window)
+    )
     return {
         "breakpoint": float(tau),
         "left_gap": float(left_gap),
         "right_gap": float(right_gap),
+        "gap_width": gap_width,
         "window": float(window),
         "supported": bool(supported),
     }
 
 
-def _unsupported_track_breakpoints(
-    t: np.ndarray,
-    track_breaks: np.ndarray,
+def _pooled_active_times_for_breakpoint(
+    tracks_data: Dict[str, np.ndarray],
+    tau: float,
+) -> Tuple[np.ndarray, List[str]]:
+    """
+    Pool all observation times from tracks whose time span contains ``tau``.
+    """
+    pooled_times = []
+    active_track_ids: List[str] = []
+    for track_id, arr in tracks_data.items():
+        t = np.asarray(arr[0], dtype=float)
+        if float(np.min(t)) < tau < float(np.max(t)):
+            pooled_times.append(t)
+            active_track_ids.append(track_id)
+    if not pooled_times:
+        return np.array([], dtype=float), []
+    return np.unique(np.concatenate(pooled_times)), active_track_ids
+
+
+def _unsupported_global_breakpoints(
+    tracks_data: Dict[str, np.ndarray],
+    global_breaks: np.ndarray,
     support_window_factor: Optional[float],
 ) -> List[Dict[str, float]]:
     """
-    Return any interior breakpoints that are not bracketed closely enough by local samples.
+    Return interior shared breakpoints that fall inside overly wide pooled
+    observation gaps.
     """
     unsupported: List[Dict[str, float]] = []
-    for tau in np.asarray(track_breaks, dtype=float)[1:-1]:
-        record = _breakpoint_support_record(t, float(tau), support_window_factor)
+    for tau in np.asarray(global_breaks, dtype=float)[1:-1]:
+        pooled_times, active_track_ids = _pooled_active_times_for_breakpoint(
+            tracks_data,
+            float(tau),
+        )
+        if not active_track_ids:
+            continue
+        record = _breakpoint_support_record(pooled_times, float(tau), support_window_factor)
         if record is not None and not bool(record["supported"]):
+            record["active_track_ids"] = active_track_ids
+            record["n_active_tracks"] = len(active_track_ids)
             unsupported.append(record)
     return unsupported
 
@@ -856,8 +891,6 @@ def _fit_track_on_shared_breaks(
     time_y: np.ndarray,
     global_breaks: np.ndarray,
     min_points: int,
-    min_segment_points: int,
-    support_window_factor: Optional[float] = 2.0,
     points_per_segment: int = 50,
 ) -> Optional[Dict[str, object]]:
     """
@@ -872,11 +905,6 @@ def _fit_track_on_shared_breaks(
     track_breaks = _track_breaks_from_global_breaks(time_y, global_breaks)
     counts = _segment_observation_counts(t, track_breaks)
     if counts.size == 0:
-        return None
-    if support_window_factor is None:
-        if np.any(counts < min_segment_points):
-            return None
-    elif _unsupported_track_breakpoints(t, track_breaks, support_window_factor):
         return None
 
     try:
@@ -914,8 +942,6 @@ def _diagnose_track_shared_break_failure(
     time_y: np.ndarray,
     global_breaks: np.ndarray,
     min_points: int,
-    min_segment_points: int,
-    support_window_factor: Optional[float] = 2.0,
 ) -> Optional[Dict[str, object]]:
     """
     Return a compact failure record for a track/shared-break fit, or None if valid.
@@ -947,46 +973,6 @@ def _diagnose_track_shared_break_failure(
             "reason": "no_segments",
             "track_breaks": rounded_breaks,
         }
-
-    if support_window_factor is None:
-        failing_idx = np.flatnonzero(counts < min_segment_points)
-        if failing_idx.size:
-            failing_segments = [
-                {
-                    "interval": (
-                        round(float(track_breaks[idx]), 6),
-                        round(float(track_breaks[idx + 1]), 6),
-                    ),
-                    "count": int(counts[idx]),
-                }
-                for idx in failing_idx
-            ]
-            return {
-                "track_id": track_id,
-                "reason": "undersampled_segment",
-                "track_breaks": rounded_breaks,
-                "segment_counts": count_list,
-                "min_segment_points": int(min_segment_points),
-                "failing_segments": failing_segments,
-            }
-    else:
-        unsupported_breaks = _unsupported_track_breakpoints(t, track_breaks, support_window_factor)
-        if unsupported_breaks:
-            return {
-                "track_id": track_id,
-                "reason": "weak_break_support",
-                "track_breaks": rounded_breaks,
-                "segment_counts": count_list,
-                "unsupported_breakpoints": [
-                    {
-                        "breakpoint": round(float(item["breakpoint"]), 6),
-                        "left_gap": round(float(item["left_gap"]), 6),
-                        "right_gap": round(float(item["right_gap"]), 6),
-                        "window": round(float(item["window"]), 6),
-                    }
-                    for item in unsupported_breaks
-                ],
-            }
 
     try:
         details = fit_linear_spline_with_breaks_details(time_y, track_breaks)
@@ -1113,30 +1099,18 @@ def _format_seed_invalid_diagnostic(diagnostic: Optional[Dict[str, object]]) -> 
     track_id = diagnostic.get("track_id", "?")
     reason = diagnostic.get("reason", "unknown")
 
-    if reason == "weak_break_support":
+    if reason == "weak_global_support":
         unsupported_breakpoints = diagnostic.get("unsupported_breakpoints", [])
         formatted_breaks = [
             f"{float(item['breakpoint']):.6f}"
             f"(left={float(item['left_gap']):.6f},"
             f" right={float(item['right_gap']):.6f},"
-            f" window={float(item['window']):.6f})"
+            f" width={float(item['gap_width']):.6f},"
+            f" window={float(item['window']):.6f},"
+            f" active_tracks={int(item['n_active_tracks'])})"
             for item in unsupported_breakpoints
         ]
-        return (
-            f"track={track_id} reason={reason} "
-            f"unsupported_breakpoints={formatted_breaks}"
-        )
-
-    if reason == "undersampled_segment":
-        failing_segments = diagnostic.get("failing_segments", [])
-        formatted_segments = [
-            f"{tuple(segment['interval'])}:{int(segment['count'])}"
-            for segment in failing_segments
-        ]
-        return (
-            f"track={track_id} reason={reason} "
-            f"failing_segments={formatted_segments}"
-        )
+        return f"reason={reason} unsupported_breakpoints={formatted_breaks}"
 
     if reason == "too_few_points":
         return (
@@ -1605,12 +1579,20 @@ def _evaluate_shared_break_configuration(
     global_breaks: np.ndarray,
     criterion: str,
     min_points: int,
-    min_segment_points: int,
     support_window_factor: Optional[float] = 2.0,
 ) -> Optional[Dict[str, object]]:
     """
     Score a shared breakpoint configuration by jointly refitting all active tracks.
     """
+    if support_window_factor is not None:
+        unsupported_breaks = _unsupported_global_breakpoints(
+            tracks_data,
+            global_breaks,
+            support_window_factor,
+        )
+        if unsupported_breaks:
+            return None
+
     total_obs = int(sum(arr.shape[1] for arr in tracks_data.values()))
     total_rss = 0.0
     total_params = int(len(global_breaks) - 2)  # shared interior break locations
@@ -1621,8 +1603,6 @@ def _evaluate_shared_break_configuration(
             arr,
             global_breaks,
             min_points=min_points,
-            min_segment_points=min_segment_points,
-            support_window_factor=support_window_factor,
         )
         if fit is None:
             return None
@@ -1647,7 +1627,6 @@ def _optimize_shared_breaks_for_segment_count(
     candidate_grid: np.ndarray,
     criterion: str,
     min_points: int,
-    min_segment_points: int,
     support_window_factor: Optional[float] = 2.0,
     max_passes: int = 12,
     bandwidth: Optional[float] = None,
@@ -1679,7 +1658,6 @@ def _optimize_shared_breaks_for_segment_count(
             global_breaks,
             criterion=criterion,
             min_points=min_points,
-            min_segment_points=min_segment_points,
             support_window_factor=support_window_factor,
         )
         if result is not None:
@@ -1697,6 +1675,31 @@ def _optimize_shared_breaks_for_segment_count(
             return None
 
         global_breaks = np.concatenate(([global_min], interior, [global_max]))
+        if support_window_factor is not None:
+            unsupported_breaks = _unsupported_global_breakpoints(
+                tracks_data,
+                global_breaks,
+                support_window_factor,
+            )
+            if unsupported_breaks:
+                diagnostic = {
+                    "reason": "weak_global_support",
+                    "unsupported_breakpoints": [
+                        {
+                            "breakpoint": round(float(item["breakpoint"]), 6),
+                            "left_gap": round(float(item["left_gap"]), 6),
+                            "right_gap": round(float(item["right_gap"]), 6),
+                            "gap_width": round(float(item["gap_width"]), 6),
+                            "window": round(float(item["window"]), 6),
+                            "n_active_tracks": int(item["n_active_tracks"]),
+                            "active_track_ids": list(item["active_track_ids"]),
+                        }
+                        for item in unsupported_breaks
+                    ],
+                }
+                diagnostic_cache[key] = diagnostic
+                return diagnostic
+
         first_failure: Optional[Dict[str, object]] = None
         for track_id, arr in tracks_data.items():
             failure = _diagnose_track_shared_break_failure(
@@ -1704,8 +1707,6 @@ def _optimize_shared_breaks_for_segment_count(
                 arr,
                 global_breaks,
                 min_points=min_points,
-                min_segment_points=min_segment_points,
-                support_window_factor=support_window_factor,
             )
             if failure is not None:
                 first_failure = failure
@@ -1732,8 +1733,6 @@ def _optimize_shared_breaks_for_segment_count(
 def _shared_break_support(
     tracks_data: Dict[str, np.ndarray],
     global_breaks: np.ndarray,
-    min_segment_points: int,
-    support_window_factor: Optional[float] = 2.0,
 ) -> np.ndarray:
     """
     Number of tracks that actively span each shared interior break.
@@ -1746,18 +1745,7 @@ def _shared_break_support(
             t = np.asarray(arr[0], dtype=float)
             if not (float(np.min(t)) < tau < float(np.max(t))):
                 continue
-            if support_window_factor is None:
-                track_breaks = _track_breaks_from_global_breaks(arr, global_breaks)
-                counts = _segment_observation_counts(t, track_breaks)
-                idx = int(np.searchsorted(track_breaks, tau, side="left"))
-                if 0 < idx < len(track_breaks) - 1:
-                    if counts[idx - 1] >= min_segment_points and counts[idx] >= min_segment_points:
-                        count += 1
-                continue
-
-            record = _breakpoint_support_record(t, float(tau), support_window_factor)
-            if record is not None and bool(record["supported"]):
-                count += 1
+            count += 1
         support.append(count)
     return np.asarray(support, dtype=int)
 
@@ -1768,7 +1756,6 @@ def fit_shared_breakpoints_joint(
     max_segments: int = 6,
     criterion: str = "bic",
     min_points: int = 4,
-    min_segment_points: int = 2,
     show_progress: bool = False,
     breakpoint_cluster_bandwidth: Optional[float] = None,
     support_window_factor: Optional[float] = 2.0,
@@ -1780,7 +1767,9 @@ def fit_shared_breakpoints_joint(
     Jointly estimate one shared breakpoint set, then refit each track on its active subset.
 
     Shared breakpoints are global in time, but each track only activates the subset
-    that lies inside its observed time span.
+    that lies inside its observed time span. Global seed validation uses pooled
+    observation times across all active tracks, while per-track validity is
+    determined only by whether the fixed-break refit succeeds with finite RSS.
     """
     global_min, global_max = _global_time_bounds(tracks_data)
     candidate_grid = _candidate_break_grid(tracks_data, fitted_breaks)
@@ -1840,7 +1829,6 @@ def fit_shared_breakpoints_joint(
             candidate_grid=candidate_grid,
             criterion=criterion,
             min_points=min_points,
-            min_segment_points=min_segment_points,
             support_window_factor=support_window_factor,
             bandwidth=breakpoint_cluster_bandwidth,
             debug=show_progress,
@@ -1944,8 +1932,6 @@ def fit_shared_breakpoints_joint(
     best_overall["global_break_support"] = _shared_break_support(
         tracks_data,
         np.asarray(best_overall["global_breaks"], dtype=float),
-        min_segment_points=min_segment_points,
-        support_window_factor=support_window_factor,
     )
     if show_progress:
         elapsed = time.perf_counter() - start_time
@@ -2397,7 +2383,6 @@ def _run_shared_breakpoint_group_fit(
     max_segments: int,
     criterion: str,
     min_points: int,
-    min_segment_points: int,
     show_progress: bool,
     breakpoint_cluster_bandwidth: Optional[float] = None,
     support_window_factor: Optional[float] = 2.0,
@@ -2417,7 +2402,6 @@ def _run_shared_breakpoint_group_fit(
         max_segments=max_segments,
         criterion=criterion,
         min_points=min_points,
-        min_segment_points=min_segment_points,
         show_progress=show_progress,
         breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
         support_window_factor=support_window_factor,
@@ -2494,16 +2478,16 @@ def spline_fit_tracks_dict(
             only by the legacy independent-fit averaging workflow, which has
             been replaced by the joint shared-breakpoint model when
             ``use_avg_breaks=True``.
-        min_segment_points: Legacy fallback for the old segment-count validity
-            rule. It is used only when ``support_window_factor`` is set to
-            ``None``.
+        min_segment_points: Retained for backward compatibility and metadata.
+            The shared-breakpoint path no longer uses it as a hard rejection
+            threshold.
         show_progress: If True, print coarse-grained progress updates during
             the joint shared-breakpoint search.
-        support_window_factor: Local breakpoint-support window in units of a
-            track's median sample spacing. Shared breakpoints are accepted
-            only when each active track has nearby samples on both sides of
-            the breakpoint. Set to ``None`` to restore the old
-            ``min_segment_points``-based rule.
+        support_window_factor: Global breakpoint-support window in units of the
+            pooled median observation spacing near each shared breakpoint.
+            Shared breakpoints are rejected only when they fall inside an overly
+            wide pooled observation gap. Set to ``None`` to disable this global
+            observability check and rely only on actual fixed-break fit success.
         debug_hypothesis_seeds: Optional manual shared-breakpoint hypotheses
             to inject when ``use_avg_breaks=True``. Each item is one interior-
             breakpoint seed, and its length maps to ``k=len(seed)+1``.
@@ -2556,7 +2540,6 @@ def spline_fit_tracks_dict(
             max_segments=max_segments,
             criterion=criterion,
             min_points=min_points,
-            min_segment_points=min_segment_points,
             show_progress=show_progress,
             breakpoint_cluster_bandwidth=breakpoint_cluster_bandwidth,
             support_window_factor=support_window_factor,
@@ -2665,7 +2648,8 @@ if __name__ == "__main__":
         exploratory_cache_path=Path("phys330/lab2/src/cache/exploratory_cache.pkl"),
         breakpoint_cluster_bandwidth=1,
         debug_hypothesis_seeds=breakpoint_hypothesis_seeds,
-        debug_validate_hypothesis_seeds=False
+        debug_validate_hypothesis_seeds=False,
+        save_path=spline_fit_save_path,
     )
     plt.figure(figsize=(8, 5))
     for track_id, pair in pruned.items():
